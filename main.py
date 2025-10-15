@@ -14,6 +14,12 @@ from numpy.random import randint
 
 app = FastAPI()
 
+
+# next:
+    # put that wait for shit in the loop in asyncio
+    # try catch shit
+    # fan_in the fuck out of it.
+
 class Req(BaseModel):
     prompt: str
 
@@ -30,13 +36,13 @@ llm_things = {
     "10": "Rome is the capital of Italy and is famous for its ancient history, architecture, and the Vatican City."
 }
 
-active_jobs = set() 
+active_jobs = asyncio.Queue() 
 toks_per_job = defaultdict(asyncio.Queue)
 
 @app.post("/submit_job")
 async def submitJob(req: Req, bg_tasks: BackgroundTasks):
     job_id = randint(1, 1000)   # job_id, will be displayed by the client.
-    active_jobs.add(job_id)
+    await active_jobs.put(job_id)
     bg_tasks.add_task(generate, job_id, randint(1, 11)) # this is scheduled after the ack is sent.
     return {"received": job_id, "msg":req.prompt}
 
@@ -46,10 +52,8 @@ async def generate(job_id: int, reply_id: int):
     c = 0  # counter will be used later 
 
     await asyncio.sleep(0.5)  
-
-    # this guarentees that the span exists #
-    # otherwise, need a buffer if the  span is not ready yet #
-    # please change to a buffer soon #
+    # this gives a minute for the span exists #
+    # TODO: please add a buffer in your client code 
 
     for tok in fake_tokens:
         await toks_per_job[job_id].put((tok, c))
@@ -58,15 +62,25 @@ async def generate(job_id: int, reply_id: int):
     await toks_per_job[job_id].put(("EOS",c))
 
 async def fan_in():
-    if active_jobs:
-        job_id = random.choice(list(active_jobs))
-        tok, id = await toks_per_job[job_id].get()
-        if tok == "EOS":
-            active_jobs.remove(job_id)
-        yield job_id, tok, id
+    job_id = await active_jobs.get()
+    tok, t_id = await toks_per_job[job_id].get()
+    if tok == "EOS":
+        toks_per_job.pop(job_id) # remove it from
     else:
-        await asyncio.sleep(0.5)
+        await active_jobs.put(job_id)
+    yield job_id, tok, t_id
+    
 
+def sse_event(job_id, token, c_id):
+    if token == "EOS":
+        data = {"job_id": job_id}
+        return f"event: job_complete\ndata: {json.dumps(data)}\n\n"
+    else:
+        data = {"job_id": job_id, "token": f"{token} "}
+        return f"event: token\ndata: {json.dumps(data)}\n\n"
+
+def sse_heartbeat():
+    return f": heartbeat\n\n"
 
 ## you got some shit SSE syntax here:
 @app.get("/events")
@@ -74,15 +88,8 @@ def stream():
     async def stream_():
         yield f": connected\n\n"
         while True:
-            async for job, tok, id in fan_in():
-                if tok == "EOS":
-                    data = {"job_id": job}
-                    yield f"event: job_complete\n"
-                    yield f"data: {json.dumps(data)}\n\n"
-                else:
-                    data = {"job_id": job, "token": f"{tok} "}
-                    yield f"event: token\n"
-                    yield f"data: {json.dumps(data)}\n\n"
+            async for job, tok, t_id in fan_in():
+                yield sse_event(job, tok, t_id)
             
     return StreamingResponse(stream_(), media_type="text/event-stream")
 

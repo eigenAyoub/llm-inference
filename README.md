@@ -108,3 +108,10 @@ A minimal single-process FastAPI service that accepts a prompt, generates tokens
 * [2. Compatible public API endpoints](#)
 * [2. Plugging a real llm (Qwen probably), put gif in](#)
 * [1. Improving SSE, per-job queue's with a fan-in, fan-out](#)
+
+### Some terminoly, readings, and TODOs:
+
+* versioning in API,. where does the `/v1/chat/..` come from?
+  * https://google.aip.dev/185
+
+* 
