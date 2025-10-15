@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Jobs + SSE</title>
+  <style>
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 24px; }
+    form { display: flex; gap: 8px; margin-bottom: 12px; }
+    #jobs { margin: 12px 0 16px; padding-left: 22px; }
+    .job-output { white-space: pre-wrap; }
+    #out { background: #f7f7f7; padding: 8px; border-radius: 6px; min-height: 1.5em; }
+  </style>
+</head>
+
+<body>
+  <form id="msg-form" autocomplete="off">
+    <input name="prompt" placeholder="Type message" required />
+    <button id="send" type="submit">Send</button>
+  </form>
+
+  <ul id="jobs"></ul>
+  <pre id="out"></pre>
+
+  <script src="/static/app.js?v=dev-42"></script>
+</body>
+
+</html>
+
+
