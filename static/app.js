@@ -6,14 +6,20 @@ const out   = document.getElementById('out');
 
 const slots = new Map();
 
-const es = new EventSource('/events');
+
+var uid = Math.random().toString(16).slice(2)
+console.log(`User ID is: ${uid}`) ;
+const es = new EventSource(`/events/?user_id=${uid}`);
 
 es.onopen = ()     => console.log('SSE connected');
 es.onerror = ()    => console.log('SSE error (browser will retry)');
-es.onmessage = (e) => console.log('DEFAULT message:', e.data);
+
+es.onmessage = (e) => {
+  console.log('DEFAULT message: ', e.data);
+  out.textContent += e.data;
+}
 
 // Expect: event: token   data: {"job_id":"...", "token":"..."}
-
 es.addEventListener('token', (e) => {
   let msg; try { msg = JSON.parse(e.data); } catch { return; }
   console.log("here >>  ",msg.job_id)
@@ -40,7 +46,7 @@ form.addEventListener('submit', async (e) => {
 
   let res;
   try {
-    res = await fetch('/submit_job', {
+    res = await fetch(`/submit_job/?user_id=${uid}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),

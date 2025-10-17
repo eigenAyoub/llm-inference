@@ -7,16 +7,21 @@ every new feature is added to the top:
 
 ## Steps:
 
+* [1. improved SSE, per-job queue's](#)
 * [0. tiny fastapi/SSE demo](#see-demo)  # i'm still here.
 * [References:](#references)
 * [AI usage:](#ai-usage)
 
 
+## 1. Slightly imporved over tiny demo:
 
+* heartbeat for sse, no busy loops, etc.
+* robin-round fairness, get(), then put() again if there are still tokens.
+* no cross-user mixing (still sharing secrets in API paths)
 
 ## 0. tiny SSE demo: 
 
-A minimal single-process FastAPI service that accepts a prompt, generates tokens, and streams them to the client (browser) via **SSE**. 
+A minimal single-processIm FastAPI service that accepts a prompt, generates tokens, and streams them to the client (browser) via **SSE**. 
 
 
 ### What the current code does
@@ -107,7 +112,6 @@ A minimal single-process FastAPI service that accepts a prompt, generates tokens
 * [3. Adding redis](#)
 * [2. Compatible public API endpoints](#)
 * [2. Plugging a real llm (Qwen probably), put gif in](#)
-* [1. Improving SSE, per-job queue's with a fan-in, fan-out](#)
 
 ### Some terminoly, readings, and TODOs:
 
@@ -115,3 +119,8 @@ A minimal single-process FastAPI service that accepts a prompt, generates tokens
   * https://google.aip.dev/185
 
 * 
+
+
+
+### Next big steps: GPT recommendations:
+

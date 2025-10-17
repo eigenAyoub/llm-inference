@@ -1,5 +1,5 @@
 import asyncio  
-import json, uuid, random 
+import json, uuid 
 from pydantic import BaseModel
 from collections import defaultdict
 
@@ -8,17 +8,10 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 
-from collections import defaultdict
 
 from numpy.random import randint
 
 app = FastAPI()
-
-
-# next:
-    # put that wait for shit in the loop in asyncio
-    # try catch shit
-    # fan_in the fuck out of it.
 
 class Req(BaseModel):
     prompt: str
@@ -36,24 +29,27 @@ llm_things = {
     "10": "Rome is the capital of Italy and is famous for its ancient history, architecture, and the Vatican City."
 }
 
-active_jobs = asyncio.Queue() 
+active_jobs = defaultdict(asyncio.Queue)
 toks_per_job = defaultdict(asyncio.Queue)
 
 @app.post("/submit_job")
-async def submitJob(req: Req, bg_tasks: BackgroundTasks):
-    job_id = randint(1, 1000)   # job_id, will be displayed by the client.
-    await active_jobs.put(job_id)
-    bg_tasks.add_task(generate, job_id, randint(1, 11)) # this is scheduled after the ack is sent.
+async def submitJob(req: Req, user_id: str, bg_tasks: BackgroundTasks):
+    job_id = uuid.uuid4().hex
+    print(f"we got this {job_id}")
+    #await active_jobs.put(job_id)
+    bg_tasks.add_task(generate, user_id, job_id, randint(1, 11)) # this is scheduled after the ack is sent.
     return {"received": job_id, "msg":req.prompt}
 
-async def generate(job_id: int, reply_id: int):
+async def generate(user_id: str, job_id: int, reply_id: int):
 
     fake_tokens = llm_things[str(reply_id)].split()
     c = 0  # counter will be used later 
 
-    await asyncio.sleep(0.5)  
     # this gives a minute for the span exists #
     # TODO: please add a buffer in your client code 
+    await asyncio.sleep(0.5)  
+
+    await active_jobs[user_id].put(job_id)
 
     for tok in fake_tokens:
         await toks_per_job[job_id].put((tok, c))
@@ -61,35 +57,49 @@ async def generate(job_id: int, reply_id: int):
         await asyncio.sleep(0.2)
     await toks_per_job[job_id].put(("EOS",c))
 
-async def fan_in():
-    job_id = await active_jobs.get()
-    tok, t_id = await toks_per_job[job_id].get()
-    if tok == "EOS":
-        toks_per_job.pop(job_id) # remove it from
-    else:
-        await active_jobs.put(job_id)
-    yield job_id, tok, t_id
-    
-
-def sse_event(job_id, token, c_id):
+def sse_event(job_id, token, t_id):
     if token == "EOS":
         data = {"job_id": job_id}
         return f"event: job_complete\ndata: {json.dumps(data)}\n\n"
     else:
-        data = {"job_id": job_id, "token": f"{token} "}
+        data = {"job_id": job_id, "token": f"{token}_{t_id}"}
         return f"event: token\ndata: {json.dumps(data)}\n\n"
 
 def sse_heartbeat():
     return f": heartbeat\n\n"
 
+async def fan_in(user_id: str):
+    try: 
+        print(f"waiting here")
+        job_id = await asyncio.wait_for(active_jobs[user_id].get(), timeout=4.0)
+        print(f"waiting here for {job_id}")
+        tok, t_id = await toks_per_job[job_id].get()
+        print(f"the toks are here {tok, t_id}")
+        if tok == "EOS":
+            toks_per_job.pop(job_id) # remove it from
+        else:
+            await active_jobs[user_id].put(job_id)
+            # why this should a `x.put_nowait()` (not awaitable btw), and not `x.put()` 
+            # \\ obv await `x.put()` enqueues it again, but why would this break fairness?
+        yield job_id, tok, t_id
+    except asyncio.TimeoutError:
+        print("timeout here fff")
+        yield -1,"dead",-1
+        pass
+    
+
 ## you got some shit SSE syntax here:
 @app.get("/events")
-def stream():
+def stream(user_id: str):
     async def stream_():
         yield f": connected\n\n"
         while True:
-            async for job, tok, t_id in fan_in():
-                yield sse_event(job, tok, t_id)
+            async for job, tok, t_id in fan_in(user_id):
+                if tok == "dead":
+                    yield sse_heartbeat()
+                    #yield "data: wtf \n"
+                else:
+                    yield sse_event(job, tok, t_id)
             
     return StreamingResponse(stream_(), media_type="text/event-stream")
 
