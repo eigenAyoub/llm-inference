@@ -6,14 +6,16 @@ const out   = document.getElementById('out');
 
 const slots = new Map();
 
-
 var uid = Math.random().toString(16).slice(2)
+var stream_id = 0
+
 console.log(`User ID is: ${uid}`) ;
-const es = new EventSource(`/events/?user_id=${uid}`);
+console.log(`Stream ID is: ${stream_id}`) ;
+
+const es = new EventSource(`/events`);
 
 es.onopen = ()     => console.log('SSE connected');
 es.onerror = ()    => console.log('SSE error (browser will retry)');
-
 es.onmessage = (e) => {
   console.log('DEFAULT message: ', e.data);
   out.textContent += e.data;
@@ -23,9 +25,17 @@ es.onmessage = (e) => {
 es.addEventListener('token', (e) => {
   let msg; try { msg = JSON.parse(e.data); } catch { return; }
   console.log("here >>  ",msg.job_id)
+  console.log("lasteventId >>  ",e.lastEventId)
   const span = slots.get(msg.job_id);
   if (span) span.textContent += " " + msg.token;
 });
+
+es.addEventListener('stream_id', (e) => {
+  let msg; try { msg = JSON.parse(e.data); } catch { return; }
+  stream_id = msg.stream_id
+  console.log(`Stream ID after is: ${stream_id}`) ;
+});
+
 
 // Expect: event: job_complete   data: {"job_id":"..."}
 es.addEventListener('job_complete', (e) => {
@@ -41,12 +51,13 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
 
   const payload = Object.fromEntries(new FormData(e.currentTarget));
+  payload.stream_id = stream_id
   console.log('payload object:', payload);
   console.log('json body:', JSON.stringify(payload));
 
   let res;
   try {
-    res = await fetch(`/submit_job/?user_id=${uid}`, {
+    res = await fetch(`/submit_job`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),

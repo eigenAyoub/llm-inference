@@ -3,18 +3,21 @@ import json, uuid
 from pydantic import BaseModel
 from collections import defaultdict
 
-from fastapi import FastAPI, BackgroundTasks 
+from fastapi import FastAPI, BackgroundTasks, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-
+import time
+from datetime import datetime, timedelta 
 
 from numpy.random import randint
+import secrets
 
 app = FastAPI()
 
-class Req(BaseModel):
+class Prompt(BaseModel):
     prompt: str
+    stream_id: str
 
 llm_things = {
     "1":  "Tokyo is the capital of Japan and is known for its blend of traditional culture and cutting-edge technology.",
@@ -29,83 +32,229 @@ llm_things = {
     "10": "Rome is the capital of Italy and is famous for its ancient history, architecture, and the Vatican City."
 }
 
-active_jobs = defaultdict(asyncio.Queue)
-toks_per_job = defaultdict(asyncio.Queue)
+Q_SIZE = 32
+
+active_jobs: dict[str, asyncio.Queue] = {}
+toks_per_job: dict[str, asyncio.Queue] = {}
+
+id_per_stream = defaultdict(int)
+job_counter = defaultdict(int)
+
+STREAMS = defaultdict(dict)          # (sid, stream_id): {.. time ..}
+SID_TO_STREAMS = defaultdict(set)    #  sid: {.. stream_id1, steam_id2,.. } 
+
+SESSIONS = dict()    # sid : {username / ttl}
+SESSION_TTL = timedelta(hours=1) 
+
+def create_session(username: str):
+    sid = secrets.token_urlsafe(32) 
+    session_id = {
+        "username" : username,
+        "ttl": datetime.now() + SESSION_TTL
+    }
+    SESSIONS[sid] = session_id 
+    return sid
 
 @app.post("/submit_job")
-async def submitJob(req: Req, user_id: str, bg_tasks: BackgroundTasks):
+async def submitJob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks):
+    #print(f"Cookies from submit:\n{request.cookies}")
     job_id = uuid.uuid4().hex
-    print(f"we got this {job_id}")
-    #await active_jobs.put(job_id)
-    bg_tasks.add_task(generate, user_id, job_id, randint(1, 11)) # this is scheduled after the ack is sent.
-    return {"received": job_id, "msg":req.prompt}
+    sid = request.cookies.get("sid")
+    print(f"Submit {job_id}")
+    
+    if not sid:
+        raise HTTPException(status_code=401, detail="un-auth")
+    rec = SESSIONS.get(sid)
+    if not rec or datetime.now() >= rec["ttl"]:
+        raise HTTPException(status_code=401, detail="you really can't submit a job")
+    rec["ttl"] = datetime.now() + SESSION_TTL
 
-async def generate(user_id: str, job_id: int, reply_id: int):
+    stream_id = prompt.stream_id
+    if (sid,stream_id) not in STREAMS:
+        raise HTTPException(status_code=403, detail="sid is fine, but can't recognize stream_id")
 
-    fake_tokens = llm_things[str(reply_id)].split()
-    c = 0  # counter will be used later 
+    bg_tasks.add_task(generate, prompt.stream_id, job_id, ) # this is scheduled after the ack is sent.
+    return {"received": job_id, "msg":prompt.prompt}
 
-    # this gives a minute for the span exists #
-    # TODO: please add a buffer in your client code 
-    await asyncio.sleep(0.5)  
+async def generate(stream_id: str, job_id: str):
 
-    await active_jobs[user_id].put(job_id)
+    ready_q = active_jobs.get(stream_id)
 
-    for tok in fake_tokens:
-        await toks_per_job[job_id].put((tok, c))
-        c += 1
+    if ready_q is None:
+        return
+
+    if job_id in toks_per_job:
+        # maybe we started it before!
+        return
+
+    toks_per_job[job_id] = asyncio.Queue(maxsize=Q_SIZE)
+    job_counter[job_id] = 0
+
+    reply_id = randint(1, 11)
+    tokens=  llm_things[str(reply_id)].split()
+    await asyncio.sleep(0.5)
+
+    for idx, tok in enumerate(tokens):
+        if active_jobs.get(stream_id) is None:
+            toks_per_job.pop(job_id, None)
+            job_counter.pop(job_id, None)
+            return
+
+        await toks_per_job[job_id].put((tok, idx))
+        if job_counter[job_id] == 0:
+            await ready_q.put(job_id)
+        job_counter[job_id] += 1
         await asyncio.sleep(0.2)
-    await toks_per_job[job_id].put(("EOS",c))
+
+    if active_jobs.get(stream_id) is None:
+        toks_per_job.pop(job_id, None)
+        job_counter.pop(job_id, None)
+        return
+
+    await toks_per_job[job_id].put(("EOS", len(tokens)))
+    if job_counter[job_id] == 0:
+        await ready_q.put(job_id)
+    job_counter[job_id] += 1
 
 def sse_event(job_id, token, t_id):
     if token == "EOS":
-        data = {"job_id": job_id}
-        return f"event: job_complete\ndata: {json.dumps(data)}\n\n"
+        data = {
+            "job_id": job_id,
+            }
+        return f"event: job_complete\ndata: {json.dumps(data)}\nid: {t_id}\n\n"
     else:
-        data = {"job_id": job_id, "token": f"{token}_{t_id}"}
-        return f"event: token\ndata: {json.dumps(data)}\n\n"
+        data = {
+            "job_id": job_id, 
+            "token": f"{token}_{t_id}",
+            }
+        return f"event: token\ndata: {json.dumps(data)}\nid: {t_id}\n\n"
 
 def sse_heartbeat():
-    return f": heartbeat\n\n"
+    return ": heartbeat\n\n"
 
-async def fan_in(user_id: str):
-    try: 
-        print(f"waiting here")
-        job_id = await asyncio.wait_for(active_jobs[user_id].get(), timeout=4.0)
-        print(f"waiting here for {job_id}")
-        tok, t_id = await toks_per_job[job_id].get()
-        print(f"the toks are here {tok, t_id}")
+async def fan_in(stream_id: str):
+    try:
+        job_id = await asyncio.wait_for(active_jobs[stream_id].get(), timeout=4.0)
+        tok, _ = await toks_per_job[job_id].get()
+        job_counter[job_id] -= 1
+        t_id   = id_per_stream[stream_id]
+        id_per_stream[stream_id] += 1
+        yield job_id, tok, t_id
         if tok == "EOS":
             toks_per_job.pop(job_id) # remove it from
-        else:
-            await active_jobs[user_id].put(job_id)
-            # why this should a `x.put_nowait()` (not awaitable btw), and not `x.put()` 
-            # \\ obv await `x.put()` enqueues it again, but why would this break fairness?
-        yield job_id, tok, t_id
+            job_counter.pop(job_id)
+        elif job_counter[job_id] > 0:
+            active_jobs[stream_id].put_nowait(job_id)
     except asyncio.TimeoutError:
-        print("timeout here fff")
-        yield -1,"dead",-1
+        yield -1,"dead",id_per_stream[stream_id]
         pass
-    
+
 
 ## you got some shit SSE syntax here:
 @app.get("/events")
-def stream(user_id: str):
-    async def stream_():
-        yield f": connected\n\n"
-        while True:
-            async for job, tok, t_id in fan_in(user_id):
-                if tok == "dead":
-                    yield sse_heartbeat()
-                    #yield "data: wtf \n"
-                else:
-                    yield sse_event(job, tok, t_id)
-            
-    return StreamingResponse(stream_(), media_type="text/event-stream")
+def stream(request: Request):
 
+    #print(f"Cookies from events: {request.cookies}")
+    #print(f"Headers of this request:")
+    #for k,v in dict(request.headers).items():
+    #    print(k,v)
+
+    sid = request.cookies.get("sid")
+    if not sid:
+        raise HTTPException(status_code=401, detail="un-auth")
+    rec = SESSIONS.get(sid)
+    if not rec or datetime.now() >= rec["ttl"]:
+        raise HTTPException(status_code=401, detail="you really can't submit a job")
+
+    rec["ttl"] = datetime.now() + SESSION_TTL
+    if len(SID_TO_STREAMS[sid]) > 5:
+        raise HTTPException(status_code=429, detail="you really can't submit a job")
+
+    stream_id =  uuid.uuid4().hex
+    STREAMS[(sid, stream_id)]["time"] = datetime.now()
+    SID_TO_STREAMS[sid].add(stream_id)
+    active_jobs[stream_id] = asyncio.Queue(maxsize=Q_SIZE)
+
+    print(f"In events:")
+    print(f"Sessions")
+
+    for u,v in SESSIONS.items():
+        print(u, v)
+
+    print(f"SID to sessions:")
+    for u,v in SID_TO_STREAMS.items():
+        print(u, v)
+
+    async def stream_():
+        try:
+            data = {
+                "stream_id": stream_id,
+                }
+
+            yield f"event: stream_id\ndata: {json.dumps(data)}\n\n"
+            yield f"retry: 2000\n\n"
+            yield f": connected\n\n"
+            while True:
+                async for job, tok, t_id in fan_in(stream_id):
+                    if tok == "dead":
+                        yield sse_heartbeat()
+                    else:
+                        yield sse_event(job, tok, t_id)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            STREAMS.pop((sid, stream_id), None)
+            s = SID_TO_STREAMS.get(sid)
+            if s: s.discard(stream_id)
+            id_per_stream.pop(stream_id, None)
+
+            q = active_jobs.get(stream_id)
+            if q:
+                try:
+                    while True:
+                        q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                active_jobs.pop(stream_id, None)
+
+    return StreamingResponse(
+        stream_(), 
+        media_type="text/event-stream",
+        headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",  
+        } 
+    )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
-def index():
-    return FileResponse("static/index.html")
+def index(response: Response, request: Request):
+
+    print(f"Calling SID_TO_STREAMS from get")
+    for k,v in SID_TO_STREAMS.items():
+        print(k,v)
+    
+    sid = request.cookies.get("sid")
+    
+    if sid not in SESSIONS:
+        print(f"session id {sid} is not in SESSIONS")
+        sid = create_session("Ayoub")
+        print(f"We just created {sid}")
+    else:
+        print(f"session id {sid} is in SESSIONS, new stream will be created in events")
+        
+
+    response = FileResponse("static/index.html")
+
+    response.set_cookie(key="sid", 
+                        value=sid,
+                        path="/", 
+                        secure=False, 
+                        httponly=True,
+                        samesite="lax",
+                        max_age=3600
+                        ) 
+    return response 
+
