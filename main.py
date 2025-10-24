@@ -1,5 +1,6 @@
-import asyncio  
-import json, uuid 
+import asyncio
+from redis.asyncio import Redis
+import json, uuid
 from pydantic import BaseModel
 from collections import defaultdict
 
@@ -8,7 +9,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import time
-from datetime import datetime, timedelta 
+from datetime import datetime, timedelta
 
 from numpy.random import randint
 import secrets
@@ -32,49 +33,93 @@ llm_things = {
     "10": "Rome is the capital of Italy and is famous for its ancient history, architecture, and the Vatican City."
 }
 
-Q_SIZE = 32
+q_size = 32
+date_format = "%Y-%m-%d %H:%M:%S.%f"
 
 active_jobs: dict[str, asyncio.Queue] = {}
 toks_per_job: dict[str, asyncio.Queue] = {}
 
-id_per_stream = defaultdict(int)
-job_counter = defaultdict(int)
+session_ttl = timedelta(hours=1)
 
-STREAMS = defaultdict(dict)          # (sid, stream_id): {.. time ..}
-SID_TO_STREAMS = defaultdict(set)    #  sid: {.. stream_id1, steam_id2,.. } 
+## Redis mirrors:
 
-SESSIONS = dict()    # sid : {username / ttl}
-SESSION_TTL = timedelta(hours=1) 
+r = Redis(host="localhost", port=6379, decode_responses=True)
 
-def create_session(username: str):
-    sid = secrets.token_urlsafe(32) 
-    session_id = {
-        "username" : username,
-        "ttl": datetime.now() + SESSION_TTL
-    }
-    SESSIONS[sid] = session_id 
+async def xadd_h(token: str, stream_id: str, job_id: str,  idx: int):
+    if token == "eos":
+        token_type = "eos"
+    else:
+        token_type = "token"
+
+    return await r.xadd(
+        f"tokens:{stream_id}",
+        {
+            "token":  token,
+            "type":   token_type, 
+            "idx": idx,
+            "job_id": job_id,
+            "stream": stream_id
+        })
+
+
+# should probably be a hash? or set?
+
+async def xadd_session(sid: str):
+    # add a session to the list of sessions
+    return await r.xadd(
+        f"sessions",
+        {
+            "sid":  sid,
+            "ttl": str(datetime.now() + session_ttl)
+        })
+
+
+# sid_to_redis_id = dict()    # sid > redis_id
+
+## set stuff: stream to sessions: to test membership:
+async def sadd_stream_to_sid(sid: str, stream_id: str):
+    return await r.sadd(f"sid:{sid}:streams", f"{stream_id}")
+
+async def sismember_stream_to_sid(sid: str, stream_id: str):
+    return await r.sismember(f"sid:{sid}:streams", f"{stream_id}")
+
+async def sremvove_stream_from_sid(sid: str, stream_id: str):
+    return await r.srem(f"sid:{sid}:streams", f"{stream_id}")
+
+# dealing with sessions:
+
+async def create_session():
+    sid = secrets.token_urlsafe(32)
+    #sid_to_redis_id[sid] = await xadd_session(sid)
+    await r.set(f"sid:{sid}", "ok", ex=3600)
+    print(f"From create_session:  We have just created a session {sid}")
+    print(f"Does the redis string sid:{sid} exists > {await r.get(f"sid:{sid}")}")
     return sid
 
 @app.post("/submit_job")
-async def submitJob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks):
-    #print(f"Cookies from submit:\n{request.cookies}")
+async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks):
+    # print(f"cookies from submit:\n{request.cookies}")
     job_id = uuid.uuid4().hex
     sid = request.cookies.get("sid")
-    print(f"Submit {job_id}")
-    
+
     if not sid:
         raise HTTPException(status_code=401, detail="un-auth")
-    rec = SESSIONS.get(sid)
-    if not rec or datetime.now() >= rec["ttl"]:
+    
+    if (await r.ttl(f"{sid}:sid")) > 0:
         raise HTTPException(status_code=401, detail="you really can't submit a job")
-    rec["ttl"] = datetime.now() + SESSION_TTL
+
+    r.expire(f"sid:{sid}", 3600)
 
     stream_id = prompt.stream_id
-    if (sid,stream_id) not in STREAMS:
+
+    if not (await r.sismember(f"sid:{sid}:streams",f"{stream_id}")) :
+        print(f"stream_id {stream_id} is not part of the streams registered for the session {sid}")
         raise HTTPException(status_code=403, detail="sid is fine, but can't recognize stream_id")
 
-    bg_tasks.add_task(generate, prompt.stream_id, job_id, ) # this is scheduled after the ack is sent.
-    return {"received": job_id, "msg":prompt.prompt}
+    # this is scheduled after the ack is sent.
+    bg_tasks.add_task(generate, prompt.stream_id, job_id)
+    return {"received": job_id, "msg": prompt.prompt}
+
 
 async def generate(stream_id: str, job_id: str):
 
@@ -87,113 +132,99 @@ async def generate(stream_id: str, job_id: str):
         # maybe we started it before!
         return
 
-    toks_per_job[job_id] = asyncio.Queue(maxsize=Q_SIZE)
-    job_counter[job_id] = 0
+    toks_per_job[job_id] = asyncio.Queue(maxsize=q_size)
 
     reply_id = randint(1, 11)
-    tokens=  llm_things[str(reply_id)].split()
+    tokens = llm_things[str(reply_id)].split()
     await asyncio.sleep(0.5)
 
-    for idx, tok in enumerate(tokens):
+    for idx, tok  in enumerate(tokens):
         if active_jobs.get(stream_id) is None:
             toks_per_job.pop(job_id, None)
-            job_counter.pop(job_id, None)
             return
 
-        await toks_per_job[job_id].put((tok, idx))
-        if job_counter[job_id] == 0:
+        # redis mirror 
+        id_tok = await xadd_h(tok, stream_id, job_id, idx)
+
+        await toks_per_job[job_id].put((tok, id_tok))
+
+        if idx == 0:                      # first token => advertise job once
             await ready_q.put(job_id)
-        job_counter[job_id] += 1
+         
         await asyncio.sleep(0.2)
 
     if active_jobs.get(stream_id) is None:
         toks_per_job.pop(job_id, None)
-        job_counter.pop(job_id, None)
         return
 
-    await toks_per_job[job_id].put(("EOS", len(tokens)))
-    if job_counter[job_id] == 0:
-        await ready_q.put(job_id)
-    job_counter[job_id] += 1
+    # redis mirror 
+    id_tok = await xadd_h("eos", stream_id, job_id, len(tokens))
+    await toks_per_job[job_id].put(("eos", id_tok))
 
 def sse_event(job_id, token, t_id):
-    if token == "EOS":
+    if token == "eos":
         data = {
             "job_id": job_id,
-            }
+        }
         return f"event: job_complete\ndata: {json.dumps(data)}\nid: {t_id}\n\n"
     else:
         data = {
-            "job_id": job_id, 
+            "job_id": job_id,
             "token": f"{token}_{t_id}",
-            }
+        }
         return f"event: token\ndata: {json.dumps(data)}\nid: {t_id}\n\n"
 
 def sse_heartbeat():
     return ": heartbeat\n\n"
 
+
 async def fan_in(stream_id: str):
     try:
         job_id = await asyncio.wait_for(active_jobs[stream_id].get(), timeout=4.0)
-        tok, _ = await toks_per_job[job_id].get()
-        job_counter[job_id] -= 1
-        t_id   = id_per_stream[stream_id]
-        id_per_stream[stream_id] += 1
-        yield job_id, tok, t_id
-        if tok == "EOS":
-            toks_per_job.pop(job_id) # remove it from
-            job_counter.pop(job_id)
-        elif job_counter[job_id] > 0:
-            active_jobs[stream_id].put_nowait(job_id)
+        tok, rid = await toks_per_job[job_id].get()
+        # redis mirror
+
+        yield job_id, tok, rid
+        if tok == "eos":
+            toks_per_job.pop(job_id)  # remove it
+        else:
+            active_jobs[stream_id].put_nowait(job_id)   # <— unconditional requeue
+
     except asyncio.TimeoutError:
-        yield -1,"dead",id_per_stream[stream_id]
+        yield -1, "dead", "-1"
         pass
 
 
-## you got some shit SSE syntax here:
+# you got some SSE syntax here:
 @app.get("/events")
-def stream(request: Request):
-
-    #print(f"Cookies from events: {request.cookies}")
-    #print(f"Headers of this request:")
-    #for k,v in dict(request.headers).items():
-    #    print(k,v)
+async def stream(request: Request):
 
     sid = request.cookies.get("sid")
+    
     if not sid:
         raise HTTPException(status_code=401, detail="un-auth")
-    rec = SESSIONS.get(sid)
-    if not rec or datetime.now() >= rec["ttl"]:
+
+    # print(f"inside events/: {await r.get(f"sid:{sid}")} {await r.ttl(f"sid:{sid}")}")
+    if (await r.ttl(f"{sid}:sid")) > 0:
         raise HTTPException(status_code=401, detail="you really can't submit a job")
 
-    rec["ttl"] = datetime.now() + SESSION_TTL
-    if len(SID_TO_STREAMS[sid]) > 5:
-        raise HTTPException(status_code=429, detail="you really can't submit a job")
 
-    stream_id =  uuid.uuid4().hex
-    STREAMS[(sid, stream_id)]["time"] = datetime.now()
-    SID_TO_STREAMS[sid].add(stream_id)
-    active_jobs[stream_id] = asyncio.Queue(maxsize=Q_SIZE)
+    if (await r.scard(f"sid:{sid}:streams"))>5:
+        raise HTTPException(status_code=429, detail="too many streams per sessions")
 
-    print(f"In events:")
-    print(f"Sessions")
-
-    for u,v in SESSIONS.items():
-        print(u, v)
-
-    print(f"SID to sessions:")
-    for u,v in SID_TO_STREAMS.items():
-        print(u, v)
+    stream_id = uuid.uuid4().hex
+    active_jobs[stream_id] = asyncio.Queue(maxsize=q_size)
+    await sadd_stream_to_sid(sid, stream_id)
 
     async def stream_():
         try:
             data = {
                 "stream_id": stream_id,
-                }
+            }
 
             yield f"event: stream_id\ndata: {json.dumps(data)}\n\n"
-            yield f"retry: 2000\n\n"
-            yield f": connected\n\n"
+            yield "retry: 2000\n\n"
+            yield ": connected\n\n"
             while True:
                 async for job, tok, t_id in fan_in(stream_id):
                     if tok == "dead":
@@ -203,58 +234,56 @@ def stream(request: Request):
         except asyncio.CancelledError:
             raise
         finally:
-            STREAMS.pop((sid, stream_id), None)
-            s = SID_TO_STREAMS.get(sid)
-            if s: s.discard(stream_id)
-            id_per_stream.pop(stream_id, None)
+            pass
+            await sremvove_stream_from_sid(sid, stream_id)
+            s = await r.get(f"sid:{sid}")
+            print(f"you have to fix this shit.")
+            if s:
+                s.discard(stream_id)
 
             q = active_jobs.get(stream_id)
             if q:
                 try:
-                    while True:
+                   while True:
                         q.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
                 active_jobs.pop(stream_id, None)
 
+            # TODO: redis clean-up
+
     return StreamingResponse(
-        stream_(), 
+        stream_(),
         media_type="text/event-stream",
-        headers = {
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",  
-        } 
+        headers={
+            "cache-control": "no-cache",
+            "connection": "keep-alive",
+            "x-accel-buffering": "no",
+        },
     )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
-def index(response: Response, request: Request):
+async def index(response: Response, request: Request):
 
-    print(f"Calling SID_TO_STREAMS from get")
-    for k,v in SID_TO_STREAMS.items():
-        print(k,v)
-    
     sid = request.cookies.get("sid")
-    
-    if sid not in SESSIONS:
-        print(f"session id {sid} is not in SESSIONS")
-        sid = create_session("Ayoub")
-        print(f"We just created {sid}")
+
+    if not await r.get(f"{sid}:sid"):
+        sid = await create_session()
+        print(f"we've just created {sid} at redis key ttl is {await r.ttl(f"sid:{sid}")} ")
     else:
-        print(f"session id {sid} is in SESSIONS, new stream will be created in events")
-        
+        print("session id is in sessions, new stream will be created in events")
 
     response = FileResponse("static/index.html")
 
-    response.set_cookie(key="sid", 
-                        value=sid,
-                        path="/", 
-                        secure=False, 
-                        httponly=True,
-                        samesite="lax",
-                        max_age=3600
-                        ) 
-    return response 
-
+    response.set_cookie(
+        key="sid",
+        value=sid,
+        path="/",
+        secure=False,
+        httponly=True,
+        samesite="lax",
+        max_age=3600,
+    )
+    return response
