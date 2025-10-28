@@ -7,12 +7,13 @@ from fastapi import FastAPI, BackgroundTasks, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from datetime import timedelta, datetime
+from contextlib import asynccontextmanager 
 
-from numpy.random import randint
+from datetime import datetime
+import random
 import secrets
 
-app = FastAPI()
+r = Redis(host="localhost", port=6379, decode_responses=True)
 
 class Prompt(BaseModel):
     prompt: str
@@ -31,23 +32,24 @@ llm_things = {
     "10": "Rome is the capital of Italy and is famous for its ancient history, architecture, and the Vatican City."
 }
 
-q_size = 32
-date_format = "%Y-%m-%d %H:%M:%S.%f"
 
-session_ttl = timedelta(hours=1)
+@asynccontextmanager
+async def  lifespan(app: FastAPI):
+    yield
+    await r.close()
 
-r = Redis(host="localhost", port=6379, decode_responses=True)
+    
+app = FastAPI(lifespan=lifespan)
+
 
 async def xadd_h(token: str, stream_id: str, job_id: str,  idx: int):
-    print(f"token {token} to tokens:{stream_id}")
+
     if token == "eos":
         token_type = "eos"
     else:
         token_type = "token"
 
-    # t_id 
-      
-    tid = await r.xadd(    
+    return await r.xadd(    
         f"tokens:{stream_id}",
         {
             "token":  token,
@@ -56,13 +58,9 @@ async def xadd_h(token: str, stream_id: str, job_id: str,  idx: int):
             "job_id": job_id,
             "stream": stream_id
         },
-        maxlen=500, 
+        maxlen=5000, 
         approximate=True # this is the default, ~
         )
-
-    await r.expire(f"tokens:{stream_id}", 3600)
-    return tid
-
 
 ## set stuff: stream to sessions: to test membership:
 async def sadd_stream_to_sid(sid: str, stream_id: str):
@@ -70,7 +68,6 @@ async def sadd_stream_to_sid(sid: str, stream_id: str):
 
 async def sismember_stream_to_sid(sid: str, stream_id: str):
     return await r.sismember(f"sid:{sid}:streams", f"{stream_id}")
-
 
 # dealing with streams in redis hashes:
 async def hadd_stream(sid, stream_id):
@@ -88,14 +85,42 @@ async def create_session():
     await r.set(f"sid:{sid}", "ok", ex=3600)
     return sid
 
+@app.post("/streams/new")
+async def new_stream(request: Request):
+
+    sid = request.cookies.get("sid")
+
+    if not sid:
+        raise HTTPException(status_code=401, detail="un-auth")
+
+    if not (await r.exists(f"sid:{sid}")):
+        raise HTTPException(status_code=401, detail="you really can't submit a job")
+
+    if (await r.scard(f"sid:{sid}:streams"))>5:
+        raise HTTPException(status_code=429, detail="too many streams per sessions")
+
+    await r.expire(f"sid:{sid}", 3600)
+
+    stream_id = uuid.uuid4().hex
+
+    await r.sadd(f"sid:{sid}:streams", stream_id)
+    await hadd_stream(sid, stream_id)          
+    await r.set(f"stream:{stream_id}:cursor","0-0")  # do you need this?
+
+    print(f">> in /streams/new/ stream_id = {stream_id} for sid = {sid}")
+
+    await r.expire(f"sid:{sid}", 3600)
+    await r.expire(f"sid:{sid}:streams", 3600)
+    await r.expire(f"stream:{stream_id}", 3600)
+    await r.expire(f"stream:{stream_id}:cursor", 3600)
+
+    return {"stream_id": stream_id}
 
 
 @app.post("/submit_job")
 async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks):
-    # print(f"cookies from submit:\n{request.cookies}")
 
     job_id = uuid.uuid4().hex
-
     sid = request.cookies.get("sid")
 
     if not sid:
@@ -125,12 +150,10 @@ async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks)
         print(f"sid = {sid} // {stream_id} is not a mem of  {sid} is_mem = {is_mem}")
         raise HTTPException(status_code=403, detail=f"Stream {stream_id} not member of sid:{sid}:streams")
 
-
     await r.expire(f"stream:{stream_id}", 3600) # hash
     await r.expire(f"sid:{sid}:streams", 3600)  # set
     await r.hincrby(f"stream:{stream_id}", "n_jobs", 1)
     
-
     print(f"sid and stream_id are okay, going to schedule the job")
 
     # this is scheduled after the ack is sent.
@@ -139,10 +162,7 @@ async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks)
 
 async def generate(stream_id: str, job_id: str):
 
-    # full redis take-over:
-    # i simply just add everything to the same stream of tokens.
-
-    reply_id = randint(1, 11)
+    reply_id = random.randint(1, 10)
     tokens = llm_things[str(reply_id)].split()
 
     await asyncio.sleep(0.5)
@@ -165,14 +185,17 @@ def sse_event(job_id, token, t_id):
             "job_id": job_id,
             "token": f"{token}_{t_id}",
         }
-        return f"event: token\ndata: {json.dumps(data)}\nid: {t_id}\n\n"
+        x = f"event: token\ndata: {json.dumps(data)}\nid: {t_id}\n\n"
+        print(x)
+        return x 
 
 def sse_heartbeat():
     return ": heartbeat\n\n"
 
 async def fan_in(stream_id: str):
-
+    
     cursor = await r.get(f"stream:{stream_id}:cursor")
+
     next_token = await r.xread({f"tokens:{stream_id}": cursor}, count = 1, block = 3000)
 
     if next_token != []:
@@ -182,22 +205,16 @@ async def fan_in(stream_id: str):
         job_id = next_token[1]["job_id"]
         await r.set(f"stream:{stream_id}:cursor", rid)
         yield job_id, tok, rid
+
         if tok == "eos":
-            #toks_per_job.pop(job_id)  # remove it
             await r.hincrby(f"stream:{stream_id}","n_jobs", -1)
     else:
         yield -1,-1,-1
 
-
-
-
-
 # you got some SSE syntax here:
 @app.get("/events")
-async def stream(request: Request):
+async def stream(request: Request, stream_id: str):
 
-    # stream creation happens here:
-    
     sid = request.cookies.get("sid")
     
     if not sid:
@@ -206,53 +223,61 @@ async def stream(request: Request):
     if not (await r.exists(f"sid:{sid}")):
         raise HTTPException(status_code=401, detail="you really can't submit a job")
 
-    if (await r.scard(f"sid:{sid}:streams"))>5:
-        raise HTTPException(status_code=429, detail="too many streams per sessions")
+    if not (await r.sismember(f"sid:{sid}:streams", stream_id)):
+        raise HTTPException(status_code=401, detail="stream id metadata doesn't exist")
 
+    if not (await r.exists(f"stream:{stream_id}")):
+        raise HTTPException(status_code=401, detail="stream id meta doesn't exist")
+    
+    last_event_id = request.headers.get("last-event-id")
 
-    stream_id = uuid.uuid4().hex
+    print(f"Stream {stream_id} already exists. last_event_id = {last_event_id}")
 
     await r.expire(f"sid:{sid}", 3600)
-
-    await r.sadd(f"sid:{sid}:streams", stream_id)
-    print(f" is {stream_id} part of sid:{sid}:streams? {await r.sismember(f"sid:{sid}:streams", stream_id)}")
-    await hadd_stream(sid, stream_id)          # add hash to stream 
-    print(f"we just added {stream_id} hash > {await r.hgetall(f"stream:{stream_id}")}")
-
     await r.expire(f"sid:{sid}:streams", 3600)
     await r.expire(f"stream:{stream_id}", 3600)
-    await r.set(f"stream:{stream_id}:cursor","0-0")
+    await r.expire(f"stream:{stream_id}:cursor", 3600)
+    
 
 
     async def stream_():
         try:
-            data = {
-                "stream_id": stream_id,
-            }
+            if last_event_id:
+                print(f"IN STREAM_ cursor moved to last_event_id")
+                await r.set(f"stream:{stream_id}:cursor", last_event_id)
+            else:
+                print(f"IN STREAM_; but no token was ever sent")
+                await r.set(f"stream:{stream_id}:cursor", "0-0")
 
-            yield f"event: stream_id\ndata: {json.dumps(data)}\n\n"
             yield "retry: 2000\n\n"
             yield ": connected\n\n"
+            
             while True:
-
                 async for job, tok, t_id in fan_in(stream_id):
                     if tok == -1:
+                        print(f"wtf")
                         yield sse_heartbeat()
                     else:
-                        gang = [f"sid:{sid}", f"sid:{sid}:streams", f"stream:{stream_id}", f"tokens:{stream_id}"]
-                        (await r.expire(k, 3600) for k in gang)
                         yield sse_event(job, tok, t_id)
+                        await r.expire(f"sid:{sid}", 3600)
+                        await r.expire(f"sid:{sid}:streams", 3600)
+                        await r.expire(f"stream:{stream_id}", 3600)
+                        await r.expire(f"stream:{stream_id}:cursor", 3600)
+                        await r.expire(f"tokens:{stream_id}", 3600)
+                        await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             raise
         finally:
-            #await r.srem(f"sid:{sid}:streams", stream_id)
+            # TODO: clean properly.
+            # most redis thingies have expiration tags, so I guess we good?
+            
             pass
 
     return StreamingResponse(
         stream_(),
         media_type="text/event-stream",
         headers={
-            "cache-control": "no-cache",
+            "cache-control": "no-cache, no-transform",
             "connection": "keep-alive",
             "x-accel-buffering": "no",
         },
@@ -267,12 +292,10 @@ async def index(response: Response, request: Request):
 
     if not await r.exists(f"sid:{sid}"):
         sid = await create_session()
-        print(f"we've just created {sid} at redis key ttl is {await r.ttl(f"sid:{sid}")} ")
+        #f"we've just created {sid} at redis key ttl is {await r.ttl(f"sid:{sid}")} ")
     else:
-        print(f"session id {sid} is in sessions, new stream will be created in events")
-        print(f"ttl = {await r.ttl(f"sid:{sid}")}")
         await r.expire(f"sid:{sid}", 3600)
-        print(f"after ttl = {await r.ttl(f"sid:{sid}")}")
+        #f"session id {sid} is in sessions 
         
 
     response = FileResponse("static/index.html")
@@ -286,4 +309,5 @@ async def index(response: Response, request: Request):
         samesite="lax",
         max_age=3600,
     )
+
     return response
