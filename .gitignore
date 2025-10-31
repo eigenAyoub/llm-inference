@@ -1,4 +1,5 @@
 gpt*
 __pycache__/
 .vscode/
+*.txt
 

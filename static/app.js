@@ -8,12 +8,13 @@ const slots = new Map();
 // then wire listeners when ready
 window.esReady = (async function () {
   var KEY = 'stream_id', id = sessionStorage.getItem(KEY);
-  if (!id) {
-    var r = await fetch('/streams/new', { method: 'POST' });
-    var d = await r.json();
-    if (!d || !d.stream_id) throw new Error('missing stream_id');
-    id = d.stream_id; sessionStorage.setItem(KEY, id);
-  }
+  var id ='123'
+  //if (!id) {
+  //  var r = await fetch('/streams/new', { method: 'POST' });
+  //  var d = await r.json();
+  //  if (!d || !d.stream_id) throw new Error('missing stream_id');
+  //  id = d.stream_id; sessionStorage.setItem(KEY, id);
+  //}
   return new EventSource('/events?stream_id=' + encodeURIComponent(id));
 })();
 
@@ -45,7 +46,8 @@ form.addEventListener('submit', async (e) => {
 
   e.preventDefault();
   const payload = Object.fromEntries(new FormData(e.currentTarget));
-  payload.stream_id = sessionStorage.getItem("stream_id");
+  //payload.stream_id = sessionStorage.getItem("stream_id");
+  payload.stream_id = '123';
   console.log('payload object:', payload);
   console.log('json body:', JSON.stringify(payload));
 

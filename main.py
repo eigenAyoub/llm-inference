@@ -13,8 +13,6 @@ from datetime import datetime
 import random
 import secrets
 
-r = Redis(host="localhost", port=6379, decode_responses=True)
-
 class Prompt(BaseModel):
     prompt: str
     stream_id: str
@@ -32,15 +30,13 @@ llm_things = {
     "10": "Rome is the capital of Italy and is famous for its ancient history, architecture, and the Vatican City."
 }
 
-
+r = Redis(host="localhost", port=6379, decode_responses=True)
 @asynccontextmanager
 async def  lifespan(app: FastAPI):
     yield
     await r.close()
 
-    
 app = FastAPI(lifespan=lifespan)
-
 
 async def xadd_h(token: str, stream_id: str, job_id: str,  idx: int):
 
