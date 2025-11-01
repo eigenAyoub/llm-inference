@@ -2,6 +2,7 @@ import asyncio
 from redis.asyncio import Redis
 import json, uuid
 from pydantic import BaseModel
+import aiohttp
 
 from fastapi import FastAPI, BackgroundTasks, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
@@ -17,28 +18,17 @@ class Prompt(BaseModel):
     prompt: str
     stream_id: str
 
-llm_things = {
-    "1":  "Tokyo is the capital of Japan and is known for its blend of traditional culture and cutting-edge technology.",
-    "2":  "Paris, the capital of France, is famous for its art, fashion, and the iconic Eiffel Tower.",
-    "3":  "Ottawa is the capital of Canada and is home to Parliament Hill and the Rideau Canal.",
-    "4":  "Canberra is the capital of Australia, located between Sydney and Melbourne, designed as a planned city.",
-    "5":  "Nairobi is the capital of Kenya and serves as a major hub for African business and wildlife tourism.",
-    "6":  "Brasília, the capital of Brazil, was built in the 1960s and is renowned for its modernist architecture.",
-    "7":  "Berlin is the capital of Germany and a city rich in history, art, and vibrant nightlife.",
-    "8":  "New Delhi is the capital of India and houses important government buildings and historic landmarks.",
-    "9":  "London, the capital of the United Kingdom, is a global center for finance, culture, and education.",
-    "10": "Rome is the capital of Italy and is famous for its ancient history, architecture, and the Vatican City."
-}
-
 r = Redis(host="localhost", port=6379, decode_responses=True)
 @asynccontextmanager
 async def  lifespan(app: FastAPI):
+    app.state.http_client = aiohttp.ClientSession()
     yield
     await r.close()
+    app.state.http_client.close()
 
 app = FastAPI(lifespan=lifespan)
 
-async def xadd_h(token: str, stream_id: str, job_id: str,  idx: int):
+async def xadd_h(token: str, stream_id: str, job_id: str):
 
     if token == "eos":
         token_type = "eos"
@@ -50,7 +40,6 @@ async def xadd_h(token: str, stream_id: str, job_id: str,  idx: int):
         {
             "token":  token,
             "type":   token_type, 
-            "idx": idx,
             "job_id": job_id,
             "stream": stream_id
         },
@@ -153,21 +142,47 @@ async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks)
     print(f"sid and stream_id are okay, going to schedule the job")
 
     # this is scheduled after the ack is sent.
-    bg_tasks.add_task(generate, prompt.stream_id, job_id)
+    bg_tasks.add_task(generate, prompt.stream_id, job_id, prompt.prompt)
     return {"received": job_id, "msg": prompt.prompt}
 
-async def generate(stream_id: str, job_id: str):
+async def generate(stream_id: str, job_id: str, p: str):
 
     reply_id = random.randint(1, 10)
     tokens = llm_things[str(reply_id)].split()
 
     await asyncio.sleep(0.5)
 
-    for idx, tok  in enumerate(tokens):
-        _ = await xadd_h(tok, stream_id, job_id, idx)
-        await asyncio.sleep(0.1)
+    async with app.state.http_client.post(
+        "http://127.0.0.1:8080/v1/chat/completions",
+        json= {"messages":
+            [
+                {"role":"user","content":p},
+            ],
+            "stream":True,
+            "temperature":0.8,
+            }
+    ) as resp:
+        async for chunk in resp.content:
+            sse_frame = chunk.decode().split(":",1)
+            if len(sse_frame) == 1:
+                # can ignore 
+                continue
+            assert sse_frame[0] == "data", "if it's not even data, do you even know what you are doing?"
+            sse_json = sse_frame[1]  # json data of the sse frame. // but could be just [DONE]\n
+            if sse_json.endswith("[DONE]\n"):
+                print(f" We are done, original frame: {sse_frame}")
+            else:
+                y = json.loads(sse_json.strip())
+                finish_reason = y["choices"][0]["finish_reason"]
+                print(y["choices"][0]["delta"], finish_reason)
+                if finish_reason == None:
+                    token = y["choices"][0]["delta"].get("content")
+                    _ = await xadd_h(str(token), stream_id, job_id)
+                elif finish_reason == "stop":
+                    # model layer termination signal
+                    print(f"End of model output {y["choices"][0]["delta"]} ")
+                    _ = await xadd_h("eos", stream_id, job_id)
 
-    _ = await xadd_h("eos", stream_id, job_id, len(tokens))
     print(f"Job {job_id} is done at tokens:{stream_id}")
 
 def sse_event(job_id, token, t_id):
@@ -179,7 +194,7 @@ def sse_event(job_id, token, t_id):
     else:
         data = {
             "job_id": job_id,
-            "token": f"{token}_{t_id}",
+            "token": token,
         }
         x = f"event: token\ndata: {json.dumps(data)}\nid: {t_id}\n\n"
         print(x)
