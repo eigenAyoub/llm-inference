@@ -1,15 +1,13 @@
 # llm-inference:
 
 
+I'm slowly building a tiny local inference engine based on some local gguf llm.  
+
 ### AI usage:
 
-I use gpt5, mostly to find flaws in my code, and suggest the next steps, and sometimes generate JS/client code, but almost never to write code for server side (python).
-
-This readme is also me dumping my code to gpt, and asking it to generate a very short readme... obviously it's not short.
+I use gpt5 mostly to find flaws in my code, suggest the next steps, and sometimes generate JS/client code. But **never** to write code for the server side. That’s why there are a lot of print statements. This `README` is also me dumping my code to gpt, and asking it to generate a very short readme... obviously it's not that short.
 
 # Minimal Realtime LLM Streaming Server (WIP)
-
-I'm slowly building a tiny local inference engine based on some local llm.  
 
 This is a FastAPI + Redis + SSE serving layer around a local LLM (llama.cpp or any OpenAI-style streaming backend). So far It provides:
 
@@ -65,7 +63,7 @@ This is still WIP. Missing pieces (with detail below):
 
 ---
 
-## What is missing / known gaps
+## Missing: 
 
 - No scheduler / fairness yet:
   - Any client can spam `/submit_job`, and each job immediately opens its own streaming request to the model backend.
