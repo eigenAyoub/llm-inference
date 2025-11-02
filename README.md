@@ -1,81 +1,118 @@
 # llm-inference:
 
 
-## Overview
-
-I'm trying to get into llm serving / llms inferene in general. For now, this is a FastAPI toy service that accepts prompts, generates “LLM” tokens in the background, and streams them to the browser via Server-Sent Events (SSE). 
-
-
-Below is basically me dumping my code to gpt, and asking it what is this code doing so far, write it as a brief README.md.
-
-## What’s implemented
-
-- **Per-user isolation:** Browser generates `user_id` and sends it to both `POST /submit_job` and `GET /events`; each user has a separate ready queue.
-- **Job submission & IDs:** `uuid4().hex` job IDs; `POST /submit_job` returns `{received, msg}`.
-- **Token-ready scheduling (no HOL stalls):** Producer enqueues **one ready entry per produced token** (plus one for `EOS`); consumer does not re-enqueue.
-- **Per-job token queues:** `toks_per_job[job_id]` buffers `(token, index)`; per-job queue removed on `EOS`.
-- **SSE stream:** Emits `event: token` (`{\"job_id\",\"token\"}`) and `event: job_complete` (`{\"job_id\"}`); heartbeats on idle.
-- **Demo frontend:** `EventSource` listeners for `token`/`job_complete`; routes tokens via `Map(job_id → span)` to update the UI.
-
-## Flow
-1. Client `POST /submit_job?user_id=...` → receives `job_id`.
-2. Background generator: for each token → push to `toks_per_job[job_id]` and enqueue `job_id` to `active_jobs[user_id]`.
-3. SSE loop `/events?user_id=...`: pop `job_id`, read one token, emit `token` or `job_complete`.
-
-## API
-- `POST /submit_job?user_id=...` → `{ \"received\": \"<job_id>\", \"msg\": \"<prompt>\" }`
-- `GET /events?user_id=...` → SSE stream (`token`, `job_complete`, heartbeats)
-- `GET /` and `/static/*` → demo UI + assets
-
-### Next Steps (always suggested by gpt):
-
-* Harden the SSE protocol — Add id: and retry: fields, handle Last-Event-ID for resume-on-reconnect, and set no-buffer/keep-alive headers to survive proxies.
-
-* Switch to a token-ready scheduler with bounds — Enqueue a job only when a token is available; bound per-job and global queues to enforce backpressure and prevent head-of-line blocking.
-
-* Make jobs durable (Redis) — Persist job status/timestamps and emitted tokens; add idempotency via request_id so duplicate submits return the same job_id.
-
-* Secure multi-tenant usage — Replace ad-hoc user_id with JWT-derived identity, enforce per-tenant rate limits/concurrency caps, and validate input sizes/CORS.
-
-* Add observability & ops hooks — Structured logs with job_id/seq, Prometheus metrics (first-token latency, tokens/sec, queue depths), /healthz & /readyz, and SSE-friendly proxy settings.
-
-### Questions:
-
-* If we hit the time-out here:
-
-```python
-    try: 
-        job_id = await asyncio.wait_for(active_jobs[user_id].get(), timeout=4.0)
-        tok, t_id = await toks_per_job[job_id].get()
-        if tok == "EOS":
-```
-
-do we lose the "next" job?
-
-
-
-### Some stuff I learned:
-
-* **Head of line blocking:**
-
-## References:
-
 ### AI usage:
 
-* I use gpt (mostly gpt-5-thinking):
-    * To analyse why my design sucks, other alternatives, and how it's done on on real world apps.
-    * To give me insights on what to do next, high livel descriptions, and pseudo-code. 
-    * Generate server side code (JS).
-    * I did not copy paste any python code.
+I use gpt5, mostly to find flaws in my code, and suggest the next steps, and sometimes generate JS/client code, but almost never to write code for server side (python).
 
-### Some readings, and TODOs:
+This readme is also me dumping my code to gpt, and asking it to generate a very short readme... obviously it's not short.
 
-* versioning in API,. where does the `/v1/chat/..` come from?
-  * https://google.aip.dev/185
+# Minimal Realtime LLM Streaming Server (WIP)
 
-* 
+I'm slowly building a tiny local inference engine based on some local llm.  
+
+This is a FastAPI + Redis + SSE serving layer around a local LLM (llama.cpp or any OpenAI-style streaming backend). So far It provides:
+
+- Per-session auth via HTTP-only cookie (`sid`) with sliding TTL in Redis.
+- Per-session "streams" so each browser tab can open its own live EventSource.
+- token-by-token streaming over SSE semantics, with heartbeats and auto-retry.
+- Redis-backed replay buffer using Redis Streams (`XADD` / `XREAD`), and `Last-Event-ID`.
+- Background generation tasks that forward tokens from the model into Redis in real time.
+
+This is still WIP. Missing pieces (with detail below): 
+
+* scheduler/fairness, 
+* cancellation of abandoned work, 
+* per-job registry, 
+* robust multi-consumer replay.
+* Proper FAISS integration from [the other repo](https://github.com/eigenAyoub/ML-prod/blob/main/main.py).
 
 
 
-### Next big steps: GPT recommendations:
+---
+
+## How it works (current state)
+
+1. **Session (`sid`)**
+   - Hitting `/` creates a session id (`sid`), stores it in Redis with TTL, and sets it as an `HttpOnly` cookie.
+   - TTL is extended on activity.
+
+2. **Stream (`stream_id`)**
+   - Browser POSTs `/streams/new`.
+   - Server creates a `stream_id`, ties it to that `sid`, and allocates Redis keys:
+     - `tokens:{stream_id}` (Redis Stream for generated tokens)
+     - `stream:{stream_id}` (hash with `sid`, `n_jobs`, timestamps)
+     - `stream:{stream_id}:cursor` (last delivered entry id for replay)
+
+3. **SSE channel**
+   - Browser opens `EventSource` to `/events?stream_id=...`.
+   - Server checks that the cookie `sid` owns that `stream_id`.
+   - Server starts sending:
+     - `retry:` (auto-reconnect hint)
+     - `: heartbeat` frames
+     - `event: token` frames with `{job_id, token}`
+     - `event: job_complete` with `{job_id}` at EOS
+   - Each SSE frame includes an `id:` equal to the Redis Stream entry id. On reconnect the browser sends `Last-Event-ID`, and the server resumes from there (single-consumer case).
+
+4. **Job submit**
+   - Browser POSTs `/submit_job` with `{prompt, stream_id}`.
+   - Server validates ownership and schedules a background `generate()` task.
+
+5. **Token generation**
+   - `generate()` calls the local model server (OpenAI-compatible streaming endpoint on `localhost:8080/v1/chat/completions` with `"stream": true`).
+   - As chunks arrive, tokens are extracted and appended to `tokens:{stream_id}` via `XADD`.
+   - On EOS, a final marker is appended so the browser can mark that job as complete.
+
+---
+
+## What is missing / known gaps
+
+- No scheduler / fairness yet:
+  - Any client can spam `/submit_job`, and each job immediately opens its own streaming request to the model backend.
+  - There is no per-session concurrency limit or first-token fairness.
+
+- No per-job registry in Redis:
+  - We don't persist job status (`queued`, `running`, `done`, `cancelled`, `error`).
+  - We can't cancel abandoned work yet.
+
+- Cursor replay is global per `stream_id`:
+  - Multiple tabs watching the same `stream_id` would fight over the same cursor.
+  - For now we assume one tab → one `stream_id`.
+
+- TTL/cleanup:
+  - Idle tabs for a long time may let the Redis session TTL expire even though the UI is still open.
+  - Disconnected clients do not currently cancel in-flight generations.
+
+---
+
+## Run it locally
+
+### 1. Start Redis / llama-server
+
+```bash
+redis-server
+
+./llama-server   -m ~/.cache/llama.cpp/ggml-org_gemma-3-1b-it-GGUF_gemma-3-1b-it-Q4_K_M.gguf   --port 8080
+```
+
+### 2. Run the FastAPI app
+
+
+```bash
+fastapi run main.py
+```
+
+### 3. Open the UI
+
+Open:
+
+```text
+http://127.0.0.1:8000/
+```
+
+In the browser:
+
+- It ensures there is a `stream_id` (via `/streams/new` if needed).
+- It opens an `EventSource` to `/events?stream_id=...`.
+- When you submit the form, it POSTs `/submit_job`, creates a `<li>` for that job, and live-appends tokens into that row as they arrive over SSE.
 

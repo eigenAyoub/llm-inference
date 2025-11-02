@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -6,6 +6,14 @@
   <style>
     body { font: 14px/1.4 system-ui, sans-serif; margin: 24px; }
     form { display: flex; gap: 8px; margin-bottom: 12px; }
+
+    /* retro-style box, slightly narrower */
+    form input[name="prompt"] {
+      flex: 1;
+      max-width: 60ch;
+      font-family: monospace;
+    }
+
     #jobs { margin: 12px 0 16px; padding-left: 22px; }
     .job-output { white-space: pre-wrap; }
     #out { background: #f7f7f7; padding: 8px; border-radius: 6px; min-height: 1.5em; }
@@ -23,7 +31,4 @@
 
   <script src="/static/app.js?v=dev-42"></script>
 </body>
-
 </html>
-
-

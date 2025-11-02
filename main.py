@@ -19,6 +19,7 @@ class Prompt(BaseModel):
     stream_id: str
 
 r = Redis(host="localhost", port=6379, decode_responses=True)
+
 @asynccontextmanager
 async def  lifespan(app: FastAPI):
     app.state.http_client = aiohttp.ClientSession()
@@ -147,8 +148,7 @@ async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks)
 
 async def generate(stream_id: str, job_id: str, p: str):
 
-    reply_id = random.randint(1, 10)
-    tokens = llm_things[str(reply_id)].split()
+    # to guarentee that a spot has been created for the job in the UI, fix this.
 
     await asyncio.sleep(0.5)
 
@@ -156,7 +156,7 @@ async def generate(stream_id: str, job_id: str, p: str):
         "http://127.0.0.1:8080/v1/chat/completions",
         json= {"messages":
             [
-                {"role":"user","content":p},
+                {"role":"user","content": f"Answer with a short sentence: {p}"},
             ],
             "stream":True,
             "temperature":0.8,
@@ -177,7 +177,10 @@ async def generate(stream_id: str, job_id: str, p: str):
                 print(y["choices"][0]["delta"], finish_reason)
                 if finish_reason == None:
                     token = y["choices"][0]["delta"].get("content")
-                    _ = await xadd_h(str(token), stream_id, job_id)
+                    if token:
+                        _ = await xadd_h(str(token), stream_id, job_id)
+                    else:
+                        print(f"no tokens! {token}")
                 elif finish_reason == "stop":
                     # model layer termination signal
                     print(f"End of model output {y["choices"][0]["delta"]} ")
@@ -275,7 +278,6 @@ async def stream(request: Request, stream_id: str):
                         await r.expire(f"stream:{stream_id}", 3600)
                         await r.expire(f"stream:{stream_id}:cursor", 3600)
                         await r.expire(f"tokens:{stream_id}", 3600)
-                        await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             raise
         finally:

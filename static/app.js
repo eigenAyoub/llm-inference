@@ -84,7 +84,7 @@ form.addEventListener('submit', async (e) => {
   li.dataset.jobId = jobId;
 
   const strong = document.createElement('strong');
-  strong.textContent = jobId + ': ';
+  strong.textContent = payload.prompt + ': ';
 
   const span = document.createElement('span');
   span.className = 'job-output';
@@ -94,5 +94,5 @@ form.addEventListener('submit', async (e) => {
 
   slots.set(jobId, span);
 
-  e.currentTarget.reset();  
+  form.reset();  
 });
