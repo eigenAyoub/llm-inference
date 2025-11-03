@@ -9,9 +9,6 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from contextlib import asynccontextmanager 
-
-from datetime import datetime
-import random
 import secrets
 
 class Prompt(BaseModel):
@@ -61,7 +58,6 @@ async def hadd_stream(sid, stream_id):
         mapping={
             "sid": sid,
             "n_jobs": 0,
-            "born": str(datetime.now())
         }
     )
 
@@ -141,7 +137,6 @@ async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks)
     job_id = uuid.uuid4().hex
     
     await r.lpush(f"{sid}:{stream_id}:waiting_jobs", job_id)   # jobs associated with the stream.
-    
     await r.hset(f"{sid}:{stream_id}:{job_id}",
                  mapping={
                      "prompt": prompt.prompt,
@@ -149,7 +144,6 @@ async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks)
                      "sid": sid,
                      "stream_id": stream_id
                  })
-
     await r.expire(f"{sid}:{stream_id}:waiting_jobs", 3600) 
     await r.expire(f"{sid}:{stream_id}:{job_id}", 3600)
 
@@ -162,28 +156,23 @@ async def submitjob(prompt: Prompt, request: Request, bg_tasks: BackgroundTasks)
 
 async def generate(sid: str, stream_id: str, job_id: str):
 
+    first_token = False
+
     # to guarentee that a spot has been created for the job in the UI, fix this.
-    first_token = True 
     p =  await r.hget(f"{sid}:{stream_id}:{job_id}", "prompt")
     print(f"we are about to fire the {p} of {sid, stream_id, job_id}")
-    
     
     async with app.state.http_client.post(
         "http://127.0.0.1:8080/v1/chat/completions",
         json= {"messages":
             [
-                {"role":"user","content": f"Answer with a short sentence: {p}"},
+                {"role":"user","content": f"Answer with 4 sentences max: {p}"},
             ],
             "stream":True,
-            "temperature":0.8,
+            "temperature":0.3,
             }
     ) as resp:
         async for chunk in resp.content:
-
-            if first_token:
-                await r.hset(f"{sid}:{stream_id}:{job_id}", "status", "processing")
-                first_token = False
-                
             sse_frame = chunk.decode().split(":",1)
             if len(sse_frame) == 1:
                 # can ignore 
@@ -191,22 +180,23 @@ async def generate(sid: str, stream_id: str, job_id: str):
             assert sse_frame[0] == "data", "if it's not even data, do you even know what you are doing?"
             sse_json = sse_frame[1]  # json data of the sse frame. // but could be just [DONE]\n
             if sse_json.endswith("[DONE]\n"):
-                print(f"Active jobs before {await r.scard(f"{sid}:{stream_id}:active_jobs")}")
-                await r.hset(f"{sid}:{stream_id}:{job_id}", "status", "done")
+                print(f"# active_jobs before del {await r.scard(f"{sid}:{stream_id}:active_jobs")}")
                 await r.srem(f"{sid}:{stream_id}:active_jobs", job_id)
-                print(f"Active jobs after {await r.scard(f"{sid}:{stream_id}:active_jobs")}")
+                print(f"# active_jobs after del {await r.scard(f"{sid}:{stream_id}:active_jobs")}")
             else:
                 y = json.loads(sse_json.strip())
                 finish_reason = y["choices"][0]["finish_reason"]
-                #print(y["choices"][0]["delta"], finish_reason)
                 if finish_reason == None:
                     token = y["choices"][0]["delta"].get("content")
                     if token:
                         _ = await xadd_h(str(token), stream_id, job_id)
                     else:
                         print(f"No tokens! {y, token}")
+                    if first_token:
+                        # this job has a token waiting now
+                        await r.sadd(f"{sid}:{stream_id}:active_tokens", job_id) 
+                        first_token = False
                 elif finish_reason == "stop":
-                    # model layer termination signal
                     print(f"End of model output {y["choices"][0]["delta"]} ")
                     _ = await xadd_h("eos", stream_id, job_id)
     print(f"Job {job_id} is done at tokens:{stream_id}")
@@ -227,6 +217,26 @@ def sse_event(job_id, token, t_id):
 
 def sse_heartbeat():
     return ": heartbeat\n\n"
+
+async def scheduler(sid, stream_id):
+    while await r.scard(f"{sid}:{stream_id}:active_jobs") < 4:
+        jobs = []
+        ll = await r.llen(f"{sid}:{stream_id}:waiting_jobs")
+        if ll > 0: 
+            print(f"length of active jobs = {ll}")
+            new_job = await r.rpop(f"{sid}:{stream_id}:waiting_jobs")
+            print(f"I'm in scheduler, the job we picked > {new_job}")
+
+            jobs.append(new_job)
+
+            await r.sadd(f"{sid}:{stream_id}:active_jobs", new_job) 
+            await r.sadd(f"{sid}:{stream_id}:active_tokens", new_job) 
+
+            asyncio.create_task(generate(sid, stream_id, new_job))
+
+        else:
+            break
+    
 
 # you got some SSE syntax here:
 @app.get("/events")
@@ -271,31 +281,31 @@ async def stream(request: Request, stream_id: str):
             yield "retry: 2000\n\n"
             yield ": connected\n\n"
             
-            cursor = await r.get(f"stream:{stream_id}:cursor")
+            rid = await r.get(f"stream:{stream_id}:cursor")
+
             while True:
-                while await r.scard(f"{sid}:{stream_id}:active_jobs") < 4:
-                    if await r.llen(f"{sid}:{stream_id}:waiting_jobs") > 0:
-                        new_job = await r.rpop(f"waiting_jobs") 
-                        await r.sadd(f"{sid}:{stream_id}:active_jobs", new_job) 
-                    else:
-                        break
-                    
-                next_token = await r.xread({f"tokens:{stream_id}": cursor}, count = 1, block = 3000)
-                if next_token != []:
-                    next_token = next_token[0][1][0]
-                    rid = next_token[0] 
-                    tok = next_token[1]["token"]
-                    job_id = next_token[1]["job_id"]
-                    await r.set(f"stream:{stream_id}:cursor", rid)
-                    yield sse_event(job_id, tok, rid)
-                    await r.expire(f"sid:{sid}", 3600)
-                    await r.expire(f"sid:{sid}:streams", 3600)
-                    await r.expire(f"stream:{stream_id}", 3600)
-                    await r.expire(f"stream:{stream_id}:cursor", 3600)
-                    await r.expire(f"tokens:{stream_id}", 3600)
-                    if tok == "eos":
-                        await r.hincrby(f"stream:{stream_id}","n_jobs", -1)
+
+                await scheduler(sid, stream_id) 
+
+                if await r.scard(f"{sid}:{stream_id}:active_tokens") > 0:
+                    next_token = await r.xread({f"tokens:{stream_id}": rid}, count = 1, block = 3000)
+                    if next_token != []:
+                        next_token = next_token[0][1][0]
+                        rid = next_token[0] 
+                        tok = next_token[1]["token"]
+                        job_id = next_token[1]["job_id"]
+                        await r.set(f"stream:{stream_id}:cursor", rid)
+                        yield sse_event(job_id, tok, rid)
+                        await r.expire(f"sid:{sid}", 3600)
+                        await r.expire(f"sid:{sid}:streams", 3600)
+                        await r.expire(f"stream:{stream_id}", 3600)
+                        await r.expire(f"stream:{stream_id}:cursor", 3600)
+                        await r.expire(f"tokens:{stream_id}", 3600)
+                        if tok == "eos":
+                            await r.hincrby(f"stream:{stream_id}","n_jobs", -1)
+                            await r.srem(f"{sid}:{stream_id}:active_tokens", job_id)
                 else:
+                    await asyncio.sleep(2.0)
                     yield sse_heartbeat()
                 
         except asyncio.CancelledError:

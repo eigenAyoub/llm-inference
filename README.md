@@ -123,3 +123,10 @@ In the browser:
 
 | `-np, --parallel N` | number of parallel sequences to decode (default: 1)<br/>(env: LLAMA_ARG_N_PARALLEL) |
 | `-cb, --cont-batching` | enable continuous batching (a.k.a dynamic batching) (default: enabled)<br/>(env: LLAMA_ARG_CONT_BATCHING) |
+
+
+###  copy these prompts:
+
+what's a tajine? in detail
+what's a croissant? in detail
+what is ptx?  in detail
