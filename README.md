@@ -114,3 +114,12 @@ In the browser:
 - It opens an `EventSource` to `/events?stream_id=...`.
 - When you submit the form, it POSTs `/submit_job`, creates a `<li>` for that job, and live-appends tokens into that row as they arrive over SSE.
 
+
+
+## Learned:
+
+
+#### -np Vs -cb in `llama-server` 
+
+| `-np, --parallel N` | number of parallel sequences to decode (default: 1)<br/>(env: LLAMA_ARG_N_PARALLEL) |
+| `-cb, --cont-batching` | enable continuous batching (a.k.a dynamic batching) (default: enabled)<br/>(env: LLAMA_ARG_CONT_BATCHING) |
